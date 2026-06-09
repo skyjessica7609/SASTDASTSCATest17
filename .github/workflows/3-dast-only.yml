@@ -1,0 +1,111 @@
+name: 3. DAST - Live Application Scan (Beginner Friendly)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+  security-events: write
+  issues: write
+
+jobs:
+  dast:
+    name: OWASP ZAP Scan (DAST)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start Flask application
+        run: |
+          python app.py > flask.log 2>&1 &
+          echo $! > flask.pid
+
+      - name: Wait for application
+        run: |
+          for i in {1..30}; do
+            if curl -fsS http://localhost:5000 > /dev/null; then
+              echo "Application is responding on http://localhost:5000"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Application failed to start"
+          cat flask.log
+          exit 1
+
+      - name: Create report directories
+        run: |
+          mkdir -p reports/baseline reports/fullscan
+
+      - name: ZAP Baseline Scan (non-blocking)
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: 'http://localhost:5000'
+          # -a: include alpha passive rules
+          # -j: generate JSON report
+          # -I: do not fail on warnings/alerts
+          cmd_options: '-a -j -I'
+          allow_issue_writing: false
+          artifact_name: 'zap-baseline-scan'
+          # Do NOT fail the job simply because alerts are present
+          fail_action: false
+
+      - name: Preserve baseline reports
+        if: always()
+        run: |
+          [ -f report_html.html ] && mv report_html.html reports/baseline/report.html || true
+          [ -f report_json.json ] && mv report_json.json reports/baseline/report.json || true
+          [ -f report_md.md ] && mv report_md.md reports/baseline/report.md || true
+
+      - name: ZAP Full Scan (non-blocking)
+        uses: zaproxy/action-full-scan@v0.12.0
+        with:
+          target: 'http://localhost:5000'
+          cmd_options: '-a -j -I'
+          allow_issue_writing: false
+          artifact_name: 'zap-fullscan-scan'
+
+      - name: Preserve full scan reports
+        if: always()
+        run: |
+          [ -f report_html.html ] && mv report_html.html reports/fullscan/report.html || true
+          [ -f report_json.json ] && mv report_json.json reports/fullscan/report.json || true
+          [ -f report_md.md ] && mv report_md.md reports/fullscan/report.md || true
+
+      - name: Upload ZAP baseline reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-baseline-reports
+          path: reports/baseline/
+
+      - name: Upload ZAP fullscan reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-fullscan-reports
+          path: reports/fullscan/
+
+      - name: Show app log (for debugging)
+        if: always()
+        run: |
+          echo "==== flask.log ===="
+          cat flask.log || true
