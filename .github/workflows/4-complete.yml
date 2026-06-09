@@ -1,0 +1,278 @@
+name: 4. Complete Security Pipeline
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+  security-events: write
+  issues: write
+
+jobs:
+  sast:
+    name: "1️⃣ SAST - Code Analysis"
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'python' ]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Perform CodeQL Analysis (SAST)
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: sast
+
+  sca:
+    name: "2️⃣ SCA - Dependency Check + pip-audit"
+    runs-on: ubuntu-latest
+    needs: sast
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run OWASP Dependency-Check (SCA)
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'calculator-app'
+          path: '.'
+          format: 'ALL'
+          out: 'reports'
+          args: >
+            --failOnCVSS 7
+            --enableRetired
+            --disableOssIndex
+
+      - name: Upload SCA reports (Dependency-Check)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sca-reports
+          path: reports/
+
+      - name: Upload SARIF to GitHub Security (if present)
+        uses: github/codeql-action/upload-sarif@v4
+        if: always() && hashFiles('reports/dependency-check-report.sarif') != ''
+        with:
+          sarif_file: reports/dependency-check-report.sarif
+          category: sca
+
+      - name: Install pip-audit
+        run: |
+          python -m pip install pip-audit
+
+      - name: Run pip-audit on requirements.txt
+        run: |
+          pip-audit -r requirements.txt -f json -o pip-audit-report.json || true
+
+      - name: Print pip-audit summary
+        run: |
+          python - << 'EOF'
+          import json, pathlib
+
+          path = pathlib.Path("pip-audit-report.json")
+          if not path.exists():
+              print("pip-audit-report.json not found, skipping summary")
+              raise SystemExit(0)
+
+          with path.open() as f:
+              data = json.load(f)
+
+          if isinstance(data, dict) and "dependencies" in data:
+              deps = data["dependencies"]
+          else:
+              deps = data
+
+          total_vulns = 0
+          vulnerable_pkgs = 0
+          for dep in deps:
+              vulns = dep.get("vulns", [])
+              if vulns:
+                  vulnerable_pkgs += 1
+                  total_vulns += len(vulns)
+
+          print(f"pip-audit summary: Found {total_vulns} known vulnerabilities in {vulnerable_pkgs} packages")
+          EOF
+
+      - name: Upload pip-audit report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pip-audit-report
+          path: pip-audit-report.json
+
+  build:
+    name: "3️⃣ Build Application"
+    runs-on: ubuntu-latest
+    needs: [sast, sca]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Test application starts
+        run: |
+          python app.py > flask.log 2>&1 &
+          for i in {1..30}; do
+            if curl -fsS http://localhost:5000 > /dev/null; then
+              echo "✅ Application builds and runs successfully"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Application failed to start"
+          cat flask.log
+          exit 1
+
+  dast:
+    name: "4️⃣ DAST - Live Security Scan (Beginner Friendly)"
+    runs-on: ubuntu-latest
+    needs: build
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Start application
+        run: |
+          python app.py > flask.log 2>&1 &
+          echo $! > flask.pid
+
+      - name: Wait for application
+        run: |
+          for i in {1..30}; do
+            if curl -fsS http://localhost:5000 > /dev/null; then
+              echo "Application is responding on http://localhost:5000"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Application failed to start"
+          cat flask.log
+          exit 1
+
+      - name: Create report directories
+        run: |
+          mkdir -p reports/baseline reports/fullscan
+
+      - name: ZAP Baseline Scan (non-blocking)
+        uses: zaproxy/action-baseline@v0.15.0
+        with:
+          target: 'http://localhost:5000'
+          cmd_options: '-a -j -I'
+          allow_issue_writing: false
+          artifact_name: 'zap-baseline-scan'
+          fail_action: false
+
+      - name: Preserve baseline reports
+        if: always()
+        run: |
+          [ -f report_html.html ] && mv report_html.html reports/baseline/report.html || true
+          [ -f report_json.json ] && mv report_json.json reports/baseline/report.json || true
+          [ -f report_md.md ] && mv report_md.md reports/baseline/report.md || true
+
+      - name: ZAP Full Scan (non-blocking)
+        uses: zaproxy/action-full-scan@v0.12.0
+        with:
+          target: 'http://localhost:5000'
+          cmd_options: '-a -j -I'
+          allow_issue_writing: false
+          artifact_name: 'zap-fullscan-scan'
+
+      - name: Preserve full scan reports
+        if: always()
+        run: |
+          [ -f report_html.html ] && mv report_html.html reports/fullscan/report.html || true
+          [ -f report_json.json ] && mv report_json.json reports/fullscan/report.json || true
+          [ -f report_md.md ] && mv report_md.md reports/fullscan/report.md || true
+
+      - name: Upload ZAP baseline reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-baseline-reports
+          path: reports/baseline/
+
+      - name: Upload ZAP fullscan reports
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: zap-fullscan-reports
+          path: reports/fullscan/
+
+  summary:
+    name: "📊 Security Summary"
+    runs-on: ubuntu-latest
+    needs: [sast, sca, dast]
+    if: always()
+
+    steps:
+      - name: Generate Security Summary
+        run: |
+          echo "# 🔒 Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "- SAST (CodeQL): completed; check Security tab for findings" >> $GITHUB_STEP_SUMMARY
+          echo "- SCA (Dependency-Check): completed; see sca-reports artifact" >> $GITHUB_STEP_SUMMARY
+          echo "- SCA (pip-audit): completed; see pip-audit-report artifact and pipeline log summary" >> $GITHUB_STEP_SUMMARY
+          echo "- DAST (ZAP): completed; see zap-baseline-reports and zap-fullscan-reports" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Notes" >> $GITHUB_STEP_SUMMARY
+          echo "- In this beginner lab, ZAP and pip-audit findings do NOT fail the pipeline. Use the reports and summaries to learn how to read and prioritize findings." >> $GITHUB_STEP_SUMMARY
